@@ -4,160 +4,162 @@ on:
   push:
     branches: [main]
     paths:
-      - 'data/**.dvc'
-      - 'src/**.py'
+      - 'data/**/*.dvc'
+      - '.dvc/config'
+      - 'src/**/*.py'
+      - 'tests/**/*.py'
+      - 'deploy/**'
       - 'params.yaml'
+      - 'requirements.txt'
+      - '.github/workflows/cicd.yml'
   workflow_dispatch:
 
-jobs:
+permissions:
+  contents: read
 
-  # ---------------------------------------------------------------------------
-  # JOB 1 - UNIT TEST
-  # Chay unit tests tren du lieu ao (khong can ket noi cloud storage).
-  # Neu co bat ky test nao that bai, pipeline dung lai o day va khong tien hanh
-  # huan luyen hay trien khai.
-  # ---------------------------------------------------------------------------
+# Serialize deployments that share the same current model.
+concurrency:
+  group: income-model-main
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  SERVER_SECURITY_GROUP_ID: sg-0a6755f4ddebc9425
+
+jobs:
   unit-test:
     name: Unit Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-
+          python-version: "3.12"
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run unit tests
-        # TODO 1: Viet lenh de chay pytest tren thu muc tests/ voi co -v
-        run: # <dien lenh o day>
+        run: python -m pytest tests/ -v
 
-
-  # ---------------------------------------------------------------------------
-  # JOB 2 - TRAIN
-  # Xac thuc cloud storage, pull du lieu bang DVC, huan luyen mo hinh, upload artifact.
-  # Chi chay khi Job 1 (Unit Test) hoan thanh thanh cong.
-  # ---------------------------------------------------------------------------
   train:
     name: Train
     needs: unit-test
     runs-on: ubuntu-latest
     outputs:
       f1: ${{ steps.read_report.outputs.f1 }}
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-
+          python-version: "3.12"
       - name: Install dependencies
         run: pip install -r requirements.txt
-
-      - name: Authenticate to Cloud Storage
-        # TODO 2: Ghi noi dung credentials ra file tam va set bien moi truong xac thuc.
-        # GCP:   echo '${{ secrets.STORAGE_CREDENTIALS }}' > /tmp/sa-key.json
-        #        echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa-key.json" >> $GITHUB_ENV
-        # AWS:   echo "AWS_ACCESS_KEY_ID=..." >> $GITHUB_ENV  (lay tu secrets)
-        #        echo "AWS_SECRET_ACCESS_KEY=..." >> $GITHUB_ENV
-        # Azure: echo "AZURE_STORAGE_CONNECTION_STRING=..." >> $GITHUB_ENV
-        run: |
-          # <dien code o day>
-
-      - name: Pull data with DVC
-        # TODO 3: Pull cac file du lieu can thiet tu cloud storage bang lenh dvc pull.
-        #         Chi pull train_batch1.csv va holdout.csv (khong can train_batch2.csv).
-        run: # <dien lenh o day>
-
+      - name: Authenticate to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Pull training and evaluation data
+        run: dvc pull data/train_batch1.csv.dvc data/holdout.csv.dvc
       - name: Train model
         run: python src/train.py
-
       - name: Read report
         id: read_report
-        # TODO 4: Doc gia tri "f1_score" tu outputs/report.json bang Python inline.
-        #         Set ket qua thanh output "f1" de job quality-gate co the doc.
-        #
-        # Goi y:
-        #   F1=$(python -c "import json; d=json.load(open('outputs/report.json')); print(d['f1_score'])")
-        #   echo "f1=$F1" >> $GITHUB_OUTPUT
         run: |
-          # <dien code o day>
-
-      - name: Upload model to Cloud Storage
-        # TODO 5: Su dung cloud SDK de upload models/model.joblib len
-        #         <bucket>/artifacts/current/model.joblib.
-        #         Ten bucket lay tu secret ARTIFACT_BUCKET.
-        run: |
-          python - <<'PYEOF'
-          # <dien code Python o day>
-          PYEOF
-
-      - name: Save report as artifact
+          python - <<'PY'
+          import json
+          import os
+          with open("outputs/report.json") as handle:
+              report = json.load(handle)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
+              handle.write(f"f1={report['f1_score']}\n")
+          print(report)
+          PY
+      - name: Save candidate model and report
         uses: actions/upload-artifact@v4
         with:
-          name: report
-          path: outputs/report.json
+          name: trained-model
+          path: |
+            models/model.joblib
+            outputs/report.json
+          if-no-files-found: error
 
-
-  # ---------------------------------------------------------------------------
-  # JOB 3 - QUALITY GATE
-  # Kiem tra nguong chat luong (f1_score >= 0.65).
-  # Pipeline dung lai o day neu mo hinh chua dat yeu cau.
-  #
-  # Luu y: nguong o day dat tren f1_score chu KHONG phai accuracy. Bo du lieu
-  # Adult co ty le lop 75/25, nen mot mo hinh doan bua "thu nhap thap" cho moi
-  # mau da dat accuracy 0.75 ma hoan toan vo dung.
-  # Chi chay khi Job 2 (Train) hoan thanh thanh cong.
-  # ---------------------------------------------------------------------------
   quality-gate:
     name: Quality Gate
     needs: train
     runs-on: ubuntu-latest
     steps:
-
-      - name: Check quality gate
-        # TODO 6: Doc f1 tu output cua job train.
-        #         Neu f1 < 0.65, ket thuc voi loi ro rang.
-        #         Neu dat nguong, in thong bao va tiep tuc.
-        #
-        # Goi y:
-        #   f1 = float("${{ needs.train.outputs.f1 }}")
-        #   if f1 < 0.65:
-        #       raise SystemExit(f"FAILED: f1_score {f1:.4f} < 0.65. Huy trien khai.")
-        #   print("PASSED: dang trien khai model.")
+      - name: Check F1 threshold
+        env:
+          MODEL_F1: ${{ needs.train.outputs.f1 }}
         run: |
-          python - <<'PYEOF'
-          # <dien code Python o day>
-          PYEOF
+          python - <<'PY'
+          import math
+          import os
+          f1 = float(os.environ["MODEL_F1"])
+          if not math.isfinite(f1) or not 0.65 <= f1 <= 1.0:
+              raise SystemExit(f"FAILED: f1_score {f1} does not meet the 0.65 threshold.")
+          print(f"PASSED: f1_score={f1:.4f}")
+          PY
 
-
-  # ---------------------------------------------------------------------------
-  # JOB 4 - RELEASE
-  # Trien khai len VM qua SSH.
-  # Chi chay khi Job 3 (Quality Gate) hoan thanh thanh cong.
-  # ---------------------------------------------------------------------------
   release:
     name: Release
     needs: quality-gate
     runs-on: ubuntu-latest
     steps:
-
-      - name: SSH deploy to VM
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: trained-model
+          path: candidate
+      - name: Install S3 SDK
+        run: pip install boto3==1.43.106
+      - name: Authenticate to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Temporarily allow runner SSH
+        id: runner_ssh
+        run: python deploy/runner_ssh.py open
+      - name: Publish approved model and report to S3
+        env:
+          ARTIFACT_BUCKET: ${{ secrets.ARTIFACT_BUCKET }}
+        run: |
+          python - <<'PY'
+          import os
+          import boto3
+          client = boto3.client("s3")
+          bucket = os.environ["ARTIFACT_BUCKET"]
+          client.upload_file("candidate/models/model.joblib", bucket, "artifacts/current/model.joblib")
+          client.upload_file("candidate/outputs/report.json", bucket, "artifacts/current/report.json")
+          PY
+      - name: Copy API code to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: src/serve.py
+          target: /home/${{ secrets.SERVER_USER }}/
+      - name: Restart API and check health
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
-            # TODO 7: Restart service income-api tren VM.
-            # TODO 8: Cho server san sang roi goi curl /healthz de xac nhan.
-            #         Neu health check that bai sau nhieu lan thu, thoat voi exit 1.
-            #
-            # Goi y:
-            #   sudo systemctl restart income-api
-            #   sleep 5
-            #   curl -sf http://localhost:8080/healthz && echo "Health check passed." || exit 1
-            # <dien lenh bash o day>
+            set -eu
+            sudo systemctl restart income-api
+            curl --fail --silent --show-error --retry 12 --retry-connrefused --retry-delay 5 --max-time 10 http://127.0.0.1:8080/healthz
+      - name: Remove temporary runner SSH rule
+        if: ${{ always() && steps.runner_ssh.outputs.rule_id != '' }}
+        env:
+          SSH_RULE_ID: ${{ steps.runner_ssh.outputs.rule_id }}
+        run: python deploy/runner_ssh.py close
